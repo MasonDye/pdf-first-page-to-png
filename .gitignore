@@ -1,0 +1,8 @@
+.venv/
+build/
+dist/
+*.spec
+__pycache__/
+
+# 本地打包快照 / 压缩包
+*.zip

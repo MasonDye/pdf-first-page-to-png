@@ -1,0 +1,85 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  APP_NAME: PDF-First-Page-To-PNG
+
+jobs:
+  build:
+    name: Build .exe on Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build single-file exe
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name "${{ env.APP_NAME }}"
+          --exclude-module numpy --exclude-module PIL --exclude-module matplotlib
+          --exclude-module pytest --exclude-module setuptools
+          pdf_to_png.py
+
+      - name: Smoke test the built exe
+        shell: pwsh
+        run: |
+          # 生成一个两页的测试 PDF，用打包好的 exe 转换：
+          # 验证 exe 能跑、输出同名 PNG、且每个 PDF 只产出一张（只取第一页）
+          New-Item -ItemType Directory -Force -Path smoke\in | Out-Null
+          @'
+          import pymupdf
+
+          doc = pymupdf.open()
+          for i in (1, 2):
+              page = doc.new_page()
+              page.insert_text((72, 100), f"smoke test page {i}", fontsize=28)
+          doc.save(r"smoke\in\sample doc.pdf")
+          doc.close()
+          '@ | Set-Content -Path make_sample.py -Encoding utf8
+          python make_sample.py
+
+          # --windowed 打包的 exe 不会阻塞调用方，必须 -Wait
+          $proc = Start-Process -FilePath "dist\${{ env.APP_NAME }}.exe" `
+                                -ArgumentList 'smoke\in', 'smoke\out', '--dpi', '100' `
+                                -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { throw "exe 退出码 $($proc.ExitCode)" }
+
+          $pngs = @(Get-ChildItem -Path smoke\out -Filter *.png -ErrorAction SilentlyContinue)
+          if ($pngs.Count -ne 1) {
+              Get-ChildItem -Recurse smoke | Out-String | Write-Host
+              throw "期望 1 个 PNG，实际 $($pngs.Count) 个"
+          }
+          if ($pngs[0].Name -ne 'sample doc.png') { throw "文件名不符: $($pngs[0].Name)" }
+
+          $exe = Get-Item "dist\${{ env.APP_NAME }}.exe"
+          Write-Host "OK  ->  $($pngs[0].Name)  $([math]::Round($pngs[0].Length / 1KB, 1)) KB"
+          Write-Host "EXE ->  $([math]::Round($exe.Length / 1MB, 1)) MB"
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-windows-x64
+          path: dist/${{ env.APP_NAME }}.exe
+          if-no-files-found: error
+          retention-days: 90
