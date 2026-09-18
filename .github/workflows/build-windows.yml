@@ -44,9 +44,10 @@ jobs:
       - name: Smoke test the built exe
         shell: pwsh
         run: |
-          # 生成一个两页的测试 PDF，用打包好的 exe 转换：
-          # 验证 exe 能跑、输出同名 PNG、且每个 PDF 只产出一张（只取第一页）
-          New-Item -ItemType Directory -Force -Path smoke\in | Out-Null
+          # 模拟客户的电子书库结构：每本书一个文件夹，PDF 躺在里面
+          # 验证 exe 能递归找到 PDF、把封面 PNG 存回 PDF 自己的文件夹、且只取第一页
+          $book = "smoke\in\【0001】测试书籍_某作者"
+          New-Item -ItemType Directory -Force -Path $book | Out-Null
           @'
           import pymupdf
 
@@ -54,26 +55,29 @@ jobs:
           for i in (1, 2):
               page = doc.new_page()
               page.insert_text((72, 100), f"smoke test page {i}", fontsize=28)
-          doc.save(r"smoke\in\sample doc.pdf")
+          doc.save("smoke/in/【0001】测试书籍_某作者/sample doc.pdf")
           doc.close()
           '@ | Set-Content -Path make_sample.py -Encoding utf8
           python make_sample.py
 
           # --windowed 打包的 exe 不会阻塞调用方，必须 -Wait
           $proc = Start-Process -FilePath "dist\${{ env.APP_NAME }}.exe" `
-                                -ArgumentList 'smoke\in', 'smoke\out', '--dpi', '100' `
+                                -ArgumentList 'smoke\in', '--dpi', '100' `
                                 -Wait -PassThru
           if ($proc.ExitCode -ne 0) { throw "exe 退出码 $($proc.ExitCode)" }
 
-          $pngs = @(Get-ChildItem -Path smoke\out -Filter *.png -ErrorAction SilentlyContinue)
+          $pngs = @(Get-ChildItem -Path smoke -Recurse -Filter *.png)
           if ($pngs.Count -ne 1) {
               Get-ChildItem -Recurse smoke | Out-String | Write-Host
               throw "期望 1 个 PNG，实际 $($pngs.Count) 个"
           }
-          if ($pngs[0].Name -ne 'sample doc.png') { throw "文件名不符: $($pngs[0].Name)" }
+          $expected = Join-Path $PWD "$book\sample doc.png"
+          if ($pngs[0].FullName -ne $expected) {
+              throw "PNG 位置不对: $($pngs[0].FullName)，应为 $expected"
+          }
 
           $exe = Get-Item "dist\${{ env.APP_NAME }}.exe"
-          Write-Host "OK  ->  $($pngs[0].Name)  $([math]::Round($pngs[0].Length / 1KB, 1)) KB"
+          Write-Host "OK  ->  封面已存回 PDF 所在文件夹: $($pngs[0].Name)  $([math]::Round($pngs[0].Length / 1KB, 1)) KB"
           Write-Host "EXE ->  $([math]::Round($exe.Length / 1MB, 1)) MB"
 
       - name: Upload exe artifact
