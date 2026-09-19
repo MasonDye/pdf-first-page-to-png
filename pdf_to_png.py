@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 APP_NAME = "PDF 首页转图片"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 CONFIG_PATH = Path.home() / ".pdf_first_page_png.json"
 
 try:
@@ -51,6 +51,16 @@ ON_EXIST_CHOICES = ("rename", "skip", "overwrite")
 FORMATS = {"png": ".png", "jpg": ".jpg"}
 DEFAULT_JPG_QUALITY = 100
 
+# 输出尺寸的四种指定方式。dpi 按打印分辨率，其余三种直接按像素。
+SIZE_MODES = ("dpi", "width", "height", "longest")
+SIZE_LIMITS = {                      # 每种模式的取值范围
+    "dpi": (1, 1200),
+    "width": (16, 10000),
+    "height": (16, 10000),
+    "longest": (16, 10000),
+}
+MAX_PIXELS = 120_000_000             # 单张图上限，防止极端参数把内存吃光
+
 # 单个文件的处理结果
 ST_PENDING = "待提取"
 ST_RUNNING = "提取中…"
@@ -64,7 +74,8 @@ class Options:
     src: Path
     dst: Path | None = None      # None = 存回 PDF 所在的文件夹（默认行为）
     fmt: str = "png"             # png / jpg
-    dpi: int = 150
+    size_mode: str = "dpi"       # dpi / width / height / longest
+    size_value: int = 150        # 含义随 size_mode 变化：DPI 或像素数
     jpg_quality: int = DEFAULT_JPG_QUALITY
     recursive: bool = True       # 默认连子文件夹一起处理
     keep_tree: bool = False      # 仅在 dst 不为 None 时有意义
@@ -84,6 +95,35 @@ def fs_path(path: Path) -> str:
     if full.startswith("\\\\"):            # UNC: \\server\share -> \\?\UNC\server\share
         return "\\\\?\\UNC\\" + full[2:]
     return "\\\\?\\" + full
+
+
+def size_zoom(page_width: float, page_height: float, mode: str, value: int) -> float:
+    """按所选尺寸模式算出渲染缩放倍数。
+
+    直接以目标倍数渲染（而不是先渲染再缩放），字迹最锐利、也没有重采样损失。
+    页面尺寸单位是 pt，72 pt = 1 英寸。
+    """
+    if page_width <= 0 or page_height <= 0:
+        raise ValueError("PDF 页面尺寸异常")
+    if mode == "width":
+        return value / page_width
+    if mode == "height":
+        return value / page_height
+    if mode == "longest":
+        return value / max(page_width, page_height)
+    return value / 72.0                                  # dpi
+
+
+def describe_size(mode: str, value: int) -> str:
+    """一句话说明当前尺寸设置的效果，用于界面提示。"""
+    if mode == "width":
+        return f"宽度固定 {value} 像素，高度按原比例"
+    if mode == "height":
+        return f"高度固定 {value} 像素，宽度按原比例"
+    if mode == "longest":
+        return f"长边不超过 {value} 像素，等比缩放"
+    a4 = (round(210 / 25.4 * value), round(297 / 25.4 * value))
+    return f"{value} DPI：A4 页面约 {a4[0]}×{a4[1]} 像素"
 
 
 def scan_pdfs(src: Path, recursive: bool = True, cancel=None) -> Iterator[Path]:
@@ -147,7 +187,11 @@ def convert_one(pdf: Path, opt: Options) -> tuple[str, Path | None, str]:
             return ST_FAIL, None, "PDF 已加密，需要密码"
         if doc.page_count < 1:
             return ST_FAIL, None, "PDF 没有任何页面"
-        pix = doc.load_page(0).get_pixmap(dpi=opt.dpi)
+        page = doc.load_page(0)
+        zoom = size_zoom(page.rect.width, page.rect.height, opt.size_mode, opt.size_value)
+        if page.rect.width * zoom * page.rect.height * zoom > MAX_PIXELS:
+            return ST_FAIL, None, "目标尺寸过大，请调小输出尺寸"
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))
         if not out.parent.exists():
             out.parent.mkdir(parents=True, exist_ok=True)
         if opt.fmt == "jpg":
@@ -156,7 +200,9 @@ def convert_one(pdf: Path, opt: Options) -> tuple[str, Path | None, str]:
             pix.save(fs_path(out))
     finally:
         doc.close()
-    note = "" if out == planned else f"已有同名文件，另存为 {out.name}"
+    note = f"{pix.width}×{pix.height}"
+    if out != planned:
+        note += f"，已有同名文件，另存为 {out.name}"
     return ST_DONE, out, note
 
 
@@ -217,8 +263,22 @@ def launch_gui() -> int:
 
     FORMAT_LABELS = {"PNG（无损）": "png", "JPG（最高画质，无色度抽样）": "jpg"}
     FORMAT_BY_VALUE = {v: k for k, v in FORMAT_LABELS.items()}
+    SIZE_MODE_LABELS = {
+        "按 DPI": "dpi",
+        "按宽度（像素）": "width",
+        "按高度（像素）": "height",
+        "按最长边（像素）": "longest",
+    }
+    SIZE_MODE_BY_VALUE = {v: k for k, v in SIZE_MODE_LABELS.items()}
+    SIZE_PRESETS = {
+        "dpi": ("72", "96", "150", "200", "300", "600"),
+        "width": ("400", "600", "800", "1000", "1200", "1600"),
+        "height": ("600", "800", "1200", "1600", "2000"),
+        "longest": ("800", "1000", "1200", "1600", "2000"),
+    }
+    SIZE_DEFAULTS = {"dpi": "150", "width": "800", "height": "1200", "longest": "1200"}
     ON_EXIST_LABELS = {
-        "自动加序号（封面 (1).png）": "rename",
+        "自动加序号（封面 (1)）": "rename",
         "跳过已存在的": "skip",
         "覆盖已有文件": "overwrite",
     }
@@ -235,7 +295,7 @@ def launch_gui() -> int:
         def __init__(self) -> None:
             super().__init__()
             self.title(f"{APP_NAME} v{APP_VERSION}")
-            self.minsize(900, 560)
+            self.minsize(1000, 580)
 
             self.queue: queue.Queue = queue.Queue()
             self.cancel = threading.Event()
@@ -246,13 +306,17 @@ def launch_gui() -> int:
 
             self.var_src = tk.StringVar()
             self.var_fmt = tk.StringVar(value=FORMAT_BY_VALUE["png"])
-            self.var_dpi = tk.StringVar(value="150")
+            self.var_size_mode = tk.StringVar(value=SIZE_MODE_BY_VALUE["dpi"])
+            self.var_size_value = tk.StringVar(value="150")
+            self.var_size_hint = tk.StringVar(value="")
             self.var_on_exist = tk.StringVar(value=LABEL_BY_VALUE["rename"])
             self.var_summary = tk.StringVar(value="尚未选择文件夹")
             self.var_status = tk.StringVar(value="就绪")
 
             self._build_ui()
+            self.cmb_size_value.configure(values=SIZE_PRESETS["dpi"])
             self._load_config()
+            self._refresh_size_hint()
             self.protocol("WM_DELETE_WINDOW", self._on_close)
             self.after(80, self._drain_queue)
             if self.var_src.get().strip():
@@ -294,13 +358,22 @@ def launch_gui() -> int:
                 state="readonly",
                 width=26,
             ).grid(row=0, column=1, sticky="w", pady=(8, 4))
-            ttk.Label(opts, text="分辨率 DPI：").grid(row=0, column=2, sticky="w", padx=(24, 4))
-            ttk.Combobox(
+            ttk.Label(opts, text="输出尺寸：").grid(row=0, column=2, sticky="w", padx=(24, 4))
+            self.cmb_size_mode = ttk.Combobox(
                 opts,
-                textvariable=self.var_dpi,
-                values=("72", "96", "150", "200", "300", "600"),
-                width=8,
-            ).grid(row=0, column=3, sticky="w")
+                textvariable=self.var_size_mode,
+                values=tuple(SIZE_MODE_LABELS),
+                state="readonly",
+                width=16,
+            )
+            self.cmb_size_mode.grid(row=0, column=3, sticky="w")
+            self.cmb_size_mode.bind("<<ComboboxSelected>>", self._on_size_mode_changed)
+            self.cmb_size_value = ttk.Combobox(opts, textvariable=self.var_size_value, width=8)
+            self.cmb_size_value.grid(row=0, column=4, sticky="w", padx=(6, 0))
+            self.var_size_value.trace_add("write", lambda *_a: self._refresh_size_hint())
+            ttk.Label(opts, textvariable=self.var_size_hint, foreground="#555555").grid(
+                row=0, column=5, sticky="w", padx=(10, 8)
+            )
 
             ttk.Label(opts, text="已有同名文件：").grid(row=1, column=0, sticky="w", padx=8, pady=(0, 8))
             ttk.Combobox(
@@ -312,9 +385,9 @@ def launch_gui() -> int:
             ).grid(row=1, column=1, sticky="w", pady=(0, 8))
             ttk.Label(
                 opts,
-                text="（默认不覆盖，自动存成「封面 (1).png」）",
+                text="（默认不覆盖，自动存成「封面 (1)」，扩展名随所选格式）",
                 foreground="#555555",
-            ).grid(row=1, column=2, columnspan=2, sticky="w", padx=(24, 8), pady=(0, 8))
+            ).grid(row=1, column=2, columnspan=4, sticky="w", padx=(24, 8), pady=(0, 8))
 
             listfrm = ttk.LabelFrame(self, text="文件列表")
             listfrm.grid(row=2, column=0, sticky="nsew", **pad)
@@ -359,6 +432,25 @@ def launch_gui() -> int:
             self.btn_stop = ttk.Button(bottom, text="停止", command=self._stop, state="disabled")
             self.btn_stop.grid(row=0, column=3, padx=4)
             ttk.Button(bottom, text="打开文件夹", command=self._open_src).grid(row=0, column=4, padx=4)
+
+        def _on_size_mode_changed(self, _event=None) -> None:
+            mode = SIZE_MODE_LABELS[self.var_size_mode.get()]
+            self.cmb_size_value.configure(values=SIZE_PRESETS[mode])
+            self.var_size_value.set(SIZE_DEFAULTS[mode])
+            self._refresh_size_hint()
+
+        def _refresh_size_hint(self) -> None:
+            mode = SIZE_MODE_LABELS[self.var_size_mode.get()]
+            low, high = SIZE_LIMITS[mode]
+            try:
+                value = int(float(self.var_size_value.get()))
+            except ValueError:
+                self.var_size_hint.set(f"请输入 {low}~{high} 之间的数字")
+                return
+            if not low <= value <= high:
+                self.var_size_hint.set(f"超出范围，应在 {low}~{high} 之间")
+                return
+            self.var_size_hint.set(describe_size(mode, value))
 
         # ---------------- 扫描 ---------------- #
         def _pick_src(self) -> None:
@@ -450,20 +542,24 @@ def launch_gui() -> int:
             if not self.pdfs:
                 messagebox.showinfo(APP_NAME, "列表里没有 PDF，请先选择文件夹。")
                 return
+            size_mode = SIZE_MODE_LABELS[self.var_size_mode.get()]
+            low, high = SIZE_LIMITS[size_mode]
             try:
-                dpi = int(float(self.var_dpi.get()))
+                size_value = int(float(self.var_size_value.get()))
             except ValueError:
-                messagebox.showerror(APP_NAME, "DPI 必须是数字。")
+                messagebox.showerror(APP_NAME, "输出尺寸必须是数字。")
                 return
-            if not 1 <= dpi <= 1200:
-                messagebox.showerror(APP_NAME, "DPI 需要在 1~1200 之间。")
+            if not low <= size_value <= high:
+                unit = "DPI" if size_mode == "dpi" else "像素"
+                messagebox.showerror(APP_NAME, f"{unit}需要在 {low}~{high} 之间。")
                 return
 
             opt = Options(
                 src=Path(self.var_src.get().strip()).expanduser(),
                 dst=None,                                  # 存回 PDF 所在目录
                 fmt=FORMAT_LABELS[self.var_fmt.get()],
-                dpi=dpi,
+                size_mode=size_mode,
+                size_value=size_value,
                 recursive=True,
                 on_exist=ON_EXIST_LABELS[self.var_on_exist.get()],
             )
@@ -590,7 +686,13 @@ def launch_gui() -> int:
                 return
             self.var_src.set(data.get("src", ""))
             self.var_fmt.set(FORMAT_BY_VALUE.get(data.get("fmt", "png"), FORMAT_BY_VALUE["png"]))
-            self.var_dpi.set(str(data.get("dpi", 150)))
+            mode = data.get("size_mode", "dpi")
+            if mode not in SIZE_MODES:
+                mode = "dpi"
+            self.var_size_mode.set(SIZE_MODE_BY_VALUE[mode])
+            self.cmb_size_value.configure(values=SIZE_PRESETS[mode])
+            # 旧版配置里只有 dpi 这个键
+            self.var_size_value.set(str(data.get("size_value", data.get("dpi", 150))))
             self.var_on_exist.set(
                 LABEL_BY_VALUE.get(data.get("on_exist", "rename"), LABEL_BY_VALUE["rename"])
             )
@@ -599,7 +701,8 @@ def launch_gui() -> int:
             data = {
                 "src": self.var_src.get(),
                 "fmt": FORMAT_LABELS[self.var_fmt.get()],
-                "dpi": self.var_dpi.get(),
+                "size_mode": SIZE_MODE_LABELS[self.var_size_mode.get()],
+                "size_value": self.var_size_value.get(),
                 "on_exist": ON_EXIST_LABELS[self.var_on_exist.get()],
             }
             try:
@@ -654,7 +757,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "-o", "--out", default=None, help="另存到指定文件夹（不给则存回每个 PDF 自己的目录）"
     )
-    parser.add_argument("--dpi", type=int, default=150, help="输出分辨率，默认 150")
+    size = parser.add_mutually_exclusive_group()
+    size.add_argument("--dpi", type=int, help="按打印分辨率输出，默认 150")
+    size.add_argument("--width", type=int, help="按像素宽度输出，高度按原比例")
+    size.add_argument("--height", type=int, help="按像素高度输出，宽度按原比例")
+    size.add_argument("--max-side", type=int, help="长边不超过该像素数，等比缩放")
     parser.add_argument(
         "--jpg-quality",
         type=int,
@@ -672,11 +779,21 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--version", action="version", version=f"{APP_NAME} {APP_VERSION}")
     args = parser.parse_args(argv)
 
+    if args.width:
+        size_mode, size_value = "width", args.width
+    elif args.height:
+        size_mode, size_value = "height", args.height
+    elif args.max_side:
+        size_mode, size_value = "longest", args.max_side
+    else:
+        size_mode, size_value = "dpi", args.dpi if args.dpi else 150
+
     opt = Options(
         src=Path(args.src).expanduser(),
         dst=Path(args.out).expanduser() if args.out else None,
         fmt=args.format,
-        dpi=args.dpi,
+        size_mode=size_mode,
+        size_value=size_value,
         jpg_quality=args.jpg_quality,
         recursive=not args.no_recursive,
         keep_tree=args.keep_tree,
@@ -685,8 +802,10 @@ def main(argv: list[str]) -> int:
     if not opt.src.is_dir():
         print(f"错误：文件夹不存在: {opt.src}", file=sys.stderr)
         return 2
-    if not 1 <= opt.dpi <= 1200:
-        print("错误：DPI 需要在 1~1200 之间", file=sys.stderr)
+    low, high = SIZE_LIMITS[opt.size_mode]
+    if not low <= opt.size_value <= high:
+        unit = "DPI" if opt.size_mode == "dpi" else "像素"
+        print(f"错误：{unit}需要在 {low}~{high} 之间", file=sys.stderr)
         return 2
     if not 1 <= opt.jpg_quality <= 100:
         print("错误：JPG 质量需要在 1~100 之间", file=sys.stderr)
@@ -695,15 +814,18 @@ def main(argv: list[str]) -> int:
         opt.dst.mkdir(parents=True, exist_ok=True)
 
     pdfs = list(scan_pdfs(opt.src, recursive=opt.recursive))
-    print(f"找到 {len(pdfs)} 个 PDF 文件，输出格式 {opt.fmt.upper()}。")
+    print(
+        f"找到 {len(pdfs)} 个 PDF 文件，输出格式 {opt.fmt.upper()}，"
+        f"{describe_size(opt.size_mode, opt.size_value)}。"
+    )
 
     def report(index: int, pdf: Path, status: str, out: Path | None, note: str) -> None:
         if status == ST_RUNNING:
             return
         mark = {ST_DONE: "✓", ST_SKIP: "–", ST_FAIL: "✗"}[status]
         tail = f"  →  {out.name}" if status == ST_DONE and out else ""
-        if note and status != ST_DONE:
-            tail = f"  {note}"
+        if note:
+            tail += f"  [{note}]" if status == ST_DONE else f"  {note}"
         print(f"[{index + 1}/{len(pdfs)}] {mark} {pdf.name}{tail}")
 
     try:

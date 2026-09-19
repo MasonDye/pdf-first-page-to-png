@@ -101,7 +101,26 @@ jobs:
               throw "期望 4 张图片，实际 $($images.Count) 张"
           }
 
-          # 5) JPG 必须是 4:4:4 无色度抽样（"尽可能无损"）
+          # 5) 按像素宽度输出：结果必须正好是 640 像素宽，且保持原比例
+          Invoke-Exe @('smoke\in', '--width', '640', '-o', 'smoke\w640')
+          Assert-File 'smoke\w640\sample doc.png'
+          @'
+          import struct
+          import sys
+
+          data = open(sys.argv[1], "rb").read()
+          width, height = struct.unpack(">II", data[16:24])
+          want = int(sys.argv[2])
+          if width != want:
+              sys.exit(f"FAIL: width is {width}, expected {want}")
+          # A4 595x842pt -> 640px wide should be ~906px tall
+          if not 890 <= height <= 920:
+              sys.exit(f"FAIL: height {height} breaks the aspect ratio")
+          print(f"OK  PNG is exactly {width}x{height}")
+          '@ | Set-Content -Path check_size.py -Encoding utf8
+          python check_size.py 'smoke\w640\sample doc.png' 640
+
+          # 6) JPG 必须是 4:4:4 无色度抽样（"尽可能无损"）
           @'
           import sys, struct
 
