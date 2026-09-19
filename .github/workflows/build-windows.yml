@@ -43,6 +43,9 @@ jobs:
 
       - name: Smoke test the built exe
         shell: pwsh
+        env:
+          # Windows runner 的控制台代码页是 cp1252，这里固定成 UTF-8
+          PYTHONIOENCODING: utf-8
         run: |
           # 模拟客户的电子书库结构：每本书一个文件夹，PDF 躺在里面
           $book = "smoke\in\【0001】测试书籍_某作者"
@@ -113,14 +116,14 @@ jobs:
                   n = data[i + 9]
                   factors = [data[i + 11 + c * 3] for c in range(n)]
                   if any(f != 0x11 for f in factors):
-                      sys.exit(f"JPG 存在色度抽样: {[hex(f) for f in factors]}")
-                  print("OK  JPG 为 4:4:4 无色度抽样")
+                      sys.exit(f"FAIL: JPG uses chroma subsampling {[hex(f) for f in factors]}")
+                  print("OK  JPG is 4:4:4 (no chroma subsampling)")
                   sys.exit(0)
               if marker == 0xD8 or marker == 0x01 or 0xD0 <= marker <= 0xD7:
                   i += 2
                   continue
               i += 2 + struct.unpack(">H", data[i + 2:i + 4])[0]
-          sys.exit("没找到 JPG 的 SOF 标记")
+          sys.exit("FAIL: no SOF marker found in JPG")
           '@ | Set-Content -Path check_jpeg.py -Encoding utf8
           python check_jpeg.py "$book\sample doc.jpg"
 

@@ -626,9 +626,23 @@ def launch_gui() -> int:
 # 命令行入口
 # --------------------------------------------------------------------------- #
 
+def use_utf8_console() -> None:
+    """让命令行输出走 UTF-8。
+
+    Windows 控制台默认用系统代码页（英文区域是 cp1252），直接 print 中文会抛
+    UnicodeEncodeError 把整批任务打断；--windowed 打包时 stdout 还可能是 None。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         return launch_gui()
+    use_utf8_console()
 
     parser = argparse.ArgumentParser(
         description="把文件夹（含子文件夹）下每个 PDF 的第一页导出为同名图片，默认存回 PDF 所在目录"
