@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""PDF 首页转 PNG 批量工具
+"""PDF 首页转图片批量工具
 
-扫描所选文件夹（含全部子文件夹）里的每一个 PDF，把第一页导出为 PNG，
+扫描所选文件夹（含全部子文件夹）里的每一个 PDF，把第一页导出为 PNG 或 JPG，
 **直接保存在该 PDF 自己所在的文件夹里**，文件名与 PDF 相同。
+目标文件已存在时不覆盖，自动追加 (1)、(2) 这样的序号。
 
 用法:
     图形界面:  python pdf_to_png.py
-    命令行:    python pdf_to_png.py <PDF文件夹> [--dpi 150] [--on-exist skip]
+    命令行:    python pdf_to_png.py <PDF文件夹> [-f png|jpg] [--dpi 150]
+                                    [--on-exist rename|skip|overwrite]
                                     [-o 另存到别处] [--no-recursive] [--keep-tree]
 """
 
@@ -25,8 +27,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator
 
-APP_NAME = "PDF 首页转 PNG"
-APP_VERSION = "2.0.0"
+APP_NAME = "PDF 首页转图片"
+APP_VERSION = "2.1.0"
 CONFIG_PATH = Path.home() / ".pdf_first_page_png.json"
 
 try:
@@ -42,7 +44,12 @@ except ImportError:  # pragma: no cover - 兼容旧版包名
 # 核心转换逻辑（与界面无关，命令行同样复用）
 # --------------------------------------------------------------------------- #
 
-ON_EXIST_CHOICES = ("skip", "overwrite", "rename")
+ON_EXIST_CHOICES = ("rename", "skip", "overwrite")
+
+# 输出格式 -> 扩展名。JPG 固定用最高质量：MuPDF 在 quality=100 时不做色度抽样
+# （4:4:4），与 Pillow 的 quality=100/subsampling=0 逐像素一致，肉眼无损。
+FORMATS = {"png": ".png", "jpg": ".jpg"}
+DEFAULT_JPG_QUALITY = 100
 
 # 单个文件的处理结果
 ST_PENDING = "待提取"
@@ -56,10 +63,12 @@ ST_FAIL = "失败"
 class Options:
     src: Path
     dst: Path | None = None      # None = 存回 PDF 所在的文件夹（默认行为）
+    fmt: str = "png"             # png / jpg
     dpi: int = 150
+    jpg_quality: int = DEFAULT_JPG_QUALITY
     recursive: bool = True       # 默认连子文件夹一起处理
     keep_tree: bool = False      # 仅在 dst 不为 None 时有意义
-    on_exist: str = "skip"       # skip / overwrite / rename
+    on_exist: str = "rename"     # rename / skip / overwrite
 
 
 def fs_path(path: Path) -> str:
@@ -95,16 +104,22 @@ def scan_pdfs(src: Path, recursive: bool = True, cancel=None) -> Iterator[Path]:
 
 
 def target_path(pdf: Path, opt: Options) -> Path:
-    """PNG 输出路径：默认与 PDF 同目录、同名，只换扩展名。"""
+    """图片输出路径：默认与 PDF 同目录、同名，只换扩展名。"""
+    suffix = FORMATS[opt.fmt]
     if opt.dst is None:
-        return pdf.with_suffix(".png")
+        return pdf.with_suffix(suffix)
     if opt.recursive and opt.keep_tree:
-        return opt.dst / pdf.parent.relative_to(opt.src) / (pdf.stem + ".png")
-    return opt.dst / (pdf.stem + ".png")
+        return opt.dst / pdf.parent.relative_to(opt.src) / (pdf.stem + suffix)
+    return opt.dst / (pdf.stem + suffix)
 
 
 def resolve_conflict(path: Path, on_exist: str) -> Path | None:
-    """处理重名：覆盖返回原路径，跳过返回 None，重命名返回 name_1.png。"""
+    """处理重名。
+
+    默认不覆盖已有文件，按资源管理器的习惯追加序号：
+    ``封面.png`` -> ``封面 (1).png`` -> ``封面 (2).png``。
+    覆盖返回原路径，跳过返回 None。
+    """
     if not path.exists():
         return path
     if on_exist == "overwrite":
@@ -113,7 +128,7 @@ def resolve_conflict(path: Path, on_exist: str) -> Path | None:
         return None
     index = 1
     while True:
-        candidate = path.with_name(f"{path.stem}_{index}{path.suffix}")
+        candidate = path.with_name(f"{path.stem} ({index}){path.suffix}")
         if not candidate.exists():
             return candidate
         index += 1
@@ -124,7 +139,7 @@ def convert_one(pdf: Path, opt: Options) -> tuple[str, Path | None, str]:
     planned = target_path(pdf, opt)
     out = resolve_conflict(planned, opt.on_exist)
     if out is None:
-        return ST_SKIP, planned, "同名 PNG 已存在"
+        return ST_SKIP, planned, f"同名 {opt.fmt.upper()} 已存在"
 
     doc = pymupdf.open(fs_path(pdf))
     try:
@@ -135,10 +150,14 @@ def convert_one(pdf: Path, opt: Options) -> tuple[str, Path | None, str]:
         pix = doc.load_page(0).get_pixmap(dpi=opt.dpi)
         if not out.parent.exists():
             out.parent.mkdir(parents=True, exist_ok=True)
-        pix.save(fs_path(out))
+        if opt.fmt == "jpg":
+            pix.save(fs_path(out), jpg_quality=opt.jpg_quality)
+        else:
+            pix.save(fs_path(out))
     finally:
         doc.close()
-    return ST_DONE, out, ""
+    note = "" if out == planned else f"已有同名文件，另存为 {out.name}"
+    return ST_DONE, out, note
 
 
 def convert_all(
@@ -196,10 +215,12 @@ def launch_gui() -> int:
         except Exception:
             pass
 
+    FORMAT_LABELS = {"PNG（无损）": "png", "JPG（最高画质，无色度抽样）": "jpg"}
+    FORMAT_BY_VALUE = {v: k for k, v in FORMAT_LABELS.items()}
     ON_EXIST_LABELS = {
+        "自动加序号（封面 (1).png）": "rename",
         "跳过已存在的": "skip",
         "覆盖已有文件": "overwrite",
-        "自动重命名（name_1.png）": "rename",
     }
     LABEL_BY_VALUE = {v: k for k, v in ON_EXIST_LABELS.items()}
     STATUS_TAG = {
@@ -224,8 +245,9 @@ def launch_gui() -> int:
             self.counts = {ST_PENDING: 0, ST_DONE: 0, ST_SKIP: 0, ST_FAIL: 0}
 
             self.var_src = tk.StringVar()
+            self.var_fmt = tk.StringVar(value=FORMAT_BY_VALUE["png"])
             self.var_dpi = tk.StringVar(value="150")
-            self.var_on_exist = tk.StringVar(value=LABEL_BY_VALUE["skip"])
+            self.var_on_exist = tk.StringVar(value=LABEL_BY_VALUE["rename"])
             self.var_summary = tk.StringVar(value="尚未选择文件夹")
             self.var_status = tk.StringVar(value="就绪")
 
@@ -257,27 +279,42 @@ def launch_gui() -> int:
 
             ttk.Label(
                 frm,
-                text="封面 PNG 会直接存回每个 PDF 所在的文件夹，文件名与 PDF 相同；所有子文件夹一并处理。",
+                text="封面图片会直接存回每个 PDF 所在的文件夹，文件名与 PDF 相同；所有子文件夹一并处理。",
                 foreground="#555555",
             ).grid(row=1, column=0, sticky="w", padx=10, pady=(0, 8))
 
             opts = ttk.LabelFrame(self, text="选项")
             opts.grid(row=1, column=0, sticky="ew", **pad)
-            ttk.Label(opts, text="分辨率 DPI：").grid(row=0, column=0, sticky="w", padx=8, pady=8)
+
+            ttk.Label(opts, text="图片格式：").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+            ttk.Combobox(
+                opts,
+                textvariable=self.var_fmt,
+                values=tuple(FORMAT_LABELS),
+                state="readonly",
+                width=26,
+            ).grid(row=0, column=1, sticky="w", pady=(8, 4))
+            ttk.Label(opts, text="分辨率 DPI：").grid(row=0, column=2, sticky="w", padx=(24, 4))
             ttk.Combobox(
                 opts,
                 textvariable=self.var_dpi,
                 values=("72", "96", "150", "200", "300", "600"),
                 width=8,
-            ).grid(row=0, column=1, sticky="w", pady=8)
-            ttk.Label(opts, text="已存在同名 PNG 时：").grid(row=0, column=2, sticky="w", padx=(24, 4))
+            ).grid(row=0, column=3, sticky="w")
+
+            ttk.Label(opts, text="已有同名文件：").grid(row=1, column=0, sticky="w", padx=8, pady=(0, 8))
             ttk.Combobox(
                 opts,
                 textvariable=self.var_on_exist,
                 values=tuple(ON_EXIST_LABELS),
                 state="readonly",
-                width=24,
-            ).grid(row=0, column=3, sticky="w")
+                width=26,
+            ).grid(row=1, column=1, sticky="w", pady=(0, 8))
+            ttk.Label(
+                opts,
+                text="（默认不覆盖，自动存成「封面 (1).png」）",
+                foreground="#555555",
+            ).grid(row=1, column=2, columnspan=2, sticky="w", padx=(24, 8), pady=(0, 8))
 
             listfrm = ttk.LabelFrame(self, text="文件列表")
             listfrm.grid(row=2, column=0, sticky="nsew", **pad)
@@ -425,6 +462,7 @@ def launch_gui() -> int:
             opt = Options(
                 src=Path(self.var_src.get().strip()).expanduser(),
                 dst=None,                                  # 存回 PDF 所在目录
+                fmt=FORMAT_LABELS[self.var_fmt.get()],
                 dpi=dpi,
                 recursive=True,
                 on_exist=ON_EXIST_LABELS[self.var_on_exist.get()],
@@ -551,14 +589,16 @@ def launch_gui() -> int:
             except Exception:
                 return
             self.var_src.set(data.get("src", ""))
+            self.var_fmt.set(FORMAT_BY_VALUE.get(data.get("fmt", "png"), FORMAT_BY_VALUE["png"]))
             self.var_dpi.set(str(data.get("dpi", 150)))
             self.var_on_exist.set(
-                LABEL_BY_VALUE.get(data.get("on_exist", "skip"), LABEL_BY_VALUE["skip"])
+                LABEL_BY_VALUE.get(data.get("on_exist", "rename"), LABEL_BY_VALUE["rename"])
             )
 
         def _save_config(self) -> None:
             data = {
                 "src": self.var_src.get(),
+                "fmt": FORMAT_LABELS[self.var_fmt.get()],
                 "dpi": self.var_dpi.get(),
                 "on_exist": ON_EXIST_LABELS[self.var_on_exist.get()],
             }
@@ -591,17 +631,29 @@ def main(argv: list[str]) -> int:
         return launch_gui()
 
     parser = argparse.ArgumentParser(
-        description="把文件夹（含子文件夹）下每个 PDF 的第一页导出为同名 PNG，默认存回 PDF 所在目录"
+        description="把文件夹（含子文件夹）下每个 PDF 的第一页导出为同名图片，默认存回 PDF 所在目录"
     )
     parser.add_argument("src", help="包含 PDF 的文件夹")
+    parser.add_argument(
+        "-f", "--format", choices=tuple(FORMATS), default="png", help="输出格式，默认 png"
+    )
     parser.add_argument(
         "-o", "--out", default=None, help="另存到指定文件夹（不给则存回每个 PDF 自己的目录）"
     )
     parser.add_argument("--dpi", type=int, default=150, help="输出分辨率，默认 150")
+    parser.add_argument(
+        "--jpg-quality",
+        type=int,
+        default=DEFAULT_JPG_QUALITY,
+        help=f"JPG 质量 1-100，默认 {DEFAULT_JPG_QUALITY}（最高画质，无色度抽样）",
+    )
     parser.add_argument("--no-recursive", action="store_true", help="只处理顶层，不进子文件夹")
     parser.add_argument("--keep-tree", action="store_true", help="配合 -o：保留子目录结构")
     parser.add_argument(
-        "--on-exist", choices=ON_EXIST_CHOICES, default="skip", help="同名 PNG 的处理方式，默认 skip"
+        "--on-exist",
+        choices=ON_EXIST_CHOICES,
+        default="rename",
+        help="已有同名文件时：rename 自动加 (1)（默认）/ skip 跳过 / overwrite 覆盖",
     )
     parser.add_argument("--version", action="version", version=f"{APP_NAME} {APP_VERSION}")
     args = parser.parse_args(argv)
@@ -609,7 +661,9 @@ def main(argv: list[str]) -> int:
     opt = Options(
         src=Path(args.src).expanduser(),
         dst=Path(args.out).expanduser() if args.out else None,
+        fmt=args.format,
         dpi=args.dpi,
+        jpg_quality=args.jpg_quality,
         recursive=not args.no_recursive,
         keep_tree=args.keep_tree,
         on_exist=args.on_exist,
@@ -620,17 +674,22 @@ def main(argv: list[str]) -> int:
     if not 1 <= opt.dpi <= 1200:
         print("错误：DPI 需要在 1~1200 之间", file=sys.stderr)
         return 2
+    if not 1 <= opt.jpg_quality <= 100:
+        print("错误：JPG 质量需要在 1~100 之间", file=sys.stderr)
+        return 2
     if opt.dst is not None:
         opt.dst.mkdir(parents=True, exist_ok=True)
 
     pdfs = list(scan_pdfs(opt.src, recursive=opt.recursive))
-    print(f"找到 {len(pdfs)} 个 PDF 文件。")
+    print(f"找到 {len(pdfs)} 个 PDF 文件，输出格式 {opt.fmt.upper()}。")
 
     def report(index: int, pdf: Path, status: str, out: Path | None, note: str) -> None:
         if status == ST_RUNNING:
             return
         mark = {ST_DONE: "✓", ST_SKIP: "–", ST_FAIL: "✗"}[status]
-        tail = f"  →  {out.name}" if status == ST_DONE and out else (f"  {note}" if note else "")
+        tail = f"  →  {out.name}" if status == ST_DONE and out else ""
+        if note and status != ST_DONE:
+            tail = f"  {note}"
         print(f"[{index + 1}/{len(pdfs)}] {mark} {pdf.name}{tail}")
 
     try:

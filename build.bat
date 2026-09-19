@@ -4,7 +4,7 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
 rem ==== 打包出来的程序名，若非 ASCII 名字导致报错，改成英文即可 ====
-set "APPNAME=PDF首页转PNG"
+set "APPNAME=PDF首页转图片"
 
 rem 有 app.ico 就用作图标
 set "ICONOPT="

@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 env:
-  APP_NAME: PDF-First-Page-To-PNG
+  APP_NAME: PDF-First-Page-To-Image
 
 jobs:
   build:
@@ -45,7 +45,6 @@ jobs:
         shell: pwsh
         run: |
           # 模拟客户的电子书库结构：每本书一个文件夹，PDF 躺在里面
-          # 验证 exe 能递归找到 PDF、把封面 PNG 存回 PDF 自己的文件夹、且只取第一页
           $book = "smoke\in\【0001】测试书籍_某作者"
           New-Item -ItemType Directory -Force -Path $book | Out-Null
           @'
@@ -61,23 +60,71 @@ jobs:
           python make_sample.py
 
           # --windowed 打包的 exe 不会阻塞调用方，必须 -Wait
-          $proc = Start-Process -FilePath "dist\${{ env.APP_NAME }}.exe" `
-                                -ArgumentList 'smoke\in', '--dpi', '100' `
-                                -Wait -PassThru
-          if ($proc.ExitCode -ne 0) { throw "exe 退出码 $($proc.ExitCode)" }
+          function Invoke-Exe {
+              param([string[]]$ExeArgs)
+              $proc = Start-Process -FilePath "dist\${{ env.APP_NAME }}.exe" `
+                                    -ArgumentList $ExeArgs -Wait -PassThru
+              if ($proc.ExitCode -ne 0) { throw "exe 退出码 $($proc.ExitCode)：$($ExeArgs -join ' ')" }
+          }
+          function Assert-File {
+              param([string]$Relative)
+              $full = Join-Path $PWD $Relative
+              if (-not (Test-Path -LiteralPath $full)) {
+                  Get-ChildItem -Recurse smoke | Out-String | Write-Host
+                  throw "缺少预期文件: $Relative"
+              }
+              $item = Get-Item -LiteralPath $full
+              Write-Host ("OK  {0,-34} {1,7:N1} KB" -f $item.Name, ($item.Length / 1KB))
+          }
 
-          $pngs = @(Get-ChildItem -Path smoke -Recurse -Filter *.png)
-          if ($pngs.Count -ne 1) {
+          # 1) 默认 PNG，封面存回 PDF 所在的文件夹
+          Invoke-Exe @('smoke\in', '--dpi', '100')
+          Assert-File "$book\sample doc.png"
+
+          # 2) JPG 导出
+          Invoke-Exe @('smoke\in', '-f', 'jpg', '--dpi', '100')
+          Assert-File "$book\sample doc.jpg"
+
+          # 3) 重复运行不覆盖，而是追加 (1) (2)
+          Invoke-Exe @('smoke\in', '-f', 'jpg', '--dpi', '100')
+          Invoke-Exe @('smoke\in', '-f', 'jpg', '--dpi', '100')
+          Assert-File "$book\sample doc (1).jpg"
+          Assert-File "$book\sample doc (2).jpg"
+
+          # 4) 每个 PDF 只取第一页：一共 1 张 png + 3 张 jpg，不多不少
+          $images = @(Get-ChildItem -Path smoke -Recurse -Include *.png, *.jpg)
+          if ($images.Count -ne 4) {
               Get-ChildItem -Recurse smoke | Out-String | Write-Host
-              throw "期望 1 个 PNG，实际 $($pngs.Count) 个"
+              throw "期望 4 张图片，实际 $($images.Count) 张"
           }
-          $expected = Join-Path $PWD "$book\sample doc.png"
-          if ($pngs[0].FullName -ne $expected) {
-              throw "PNG 位置不对: $($pngs[0].FullName)，应为 $expected"
-          }
+
+          # 5) JPG 必须是 4:4:4 无色度抽样（"尽可能无损"）
+          @'
+          import sys, struct
+
+          data = open(sys.argv[1], "rb").read()
+          i = 2
+          while i < len(data):
+              if data[i] != 0xFF:
+                  i += 1
+                  continue
+              marker = data[i + 1]
+              if marker in (0xC0, 0xC1, 0xC2):
+                  n = data[i + 9]
+                  factors = [data[i + 11 + c * 3] for c in range(n)]
+                  if any(f != 0x11 for f in factors):
+                      sys.exit(f"JPG 存在色度抽样: {[hex(f) for f in factors]}")
+                  print("OK  JPG 为 4:4:4 无色度抽样")
+                  sys.exit(0)
+              if marker == 0xD8 or marker == 0x01 or 0xD0 <= marker <= 0xD7:
+                  i += 2
+                  continue
+              i += 2 + struct.unpack(">H", data[i + 2:i + 4])[0]
+          sys.exit("没找到 JPG 的 SOF 标记")
+          '@ | Set-Content -Path check_jpeg.py -Encoding utf8
+          python check_jpeg.py "$book\sample doc.jpg"
 
           $exe = Get-Item "dist\${{ env.APP_NAME }}.exe"
-          Write-Host "OK  ->  封面已存回 PDF 所在文件夹: $($pngs[0].Name)  $([math]::Round($pngs[0].Length / 1KB, 1)) KB"
           Write-Host "EXE ->  $([math]::Round($exe.Length / 1MB, 1)) MB"
 
       - name: Upload exe artifact

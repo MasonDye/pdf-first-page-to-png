@@ -2,7 +2,7 @@
 # Linux/macOS 下打包（产物是本平台可执行文件，不是 .exe）
 set -e
 cd "$(dirname "$0")"
-APPNAME="pdf-first-page-png"
+APPNAME="pdf-first-page-image"
 python -m pip install -r requirements.txt pyinstaller
 python -m PyInstaller --noconfirm --clean --onefile --windowed \
     --name "$APPNAME" \
